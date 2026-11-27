@@ -1,0 +1,12 @@
+{
+  "name": "context_meter",
+  "version": "1.5.0",
+  "type": "module",
+  "description": "Context window usage and Context Guard sidecar UI",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "test": "node --test meter.test.mjs"
+  }
+}

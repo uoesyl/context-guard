@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+node_modules/
+*.tmp
+*.lock
+*.bak
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="frame-src 'none'; child-src 'none'">
+  <title>Context Meter</title>
+  <script src="/preload.js"></script>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="shell">
+    <header class="header">
+      <div class="header-left">
+        <span class="title">Context Meter</span>
+        <span id="conv-badge" class="conv-badge" title="Current conversation ID">--</span>
+      </div>
+      <div class="header-right">
+        <span id="guard-badge" class="guard-badge level-0" data-testid="guard-badge">正常</span>
+        <span id="live-pill" class="live-pill" title="Auto-refreshing">
+          <span class="live-dot" aria-hidden="true"></span>
+          <span id="live-text">Live</span>
+        </span>
+      </div>
+    </header>
+
+    <main id="dashboard" class="dashboard hidden">
+      <section id="alert-banner" class="alert-banner hidden" role="status"></section>
+
+      <section class="card meter-card" aria-label="Context usage">
+        <div class="meter-top">
+          <div class="meter-primary">
+            <span id="usage-value" class="usage-value" data-testid="usage-value">--</span>
+            <span id="usage-unit" class="usage-unit">/ ~512k tokens</span>
+          </div>
+          <span id="usage-pct" class="usage-pct" data-testid="usage-pct">--%</span>
+        </div>
+
+        <div class="gauge-wrap" aria-hidden="true">
+          <div class="gauge-track">
+            <div id="gauge-fill" class="gauge-fill level-0" style="width: 0%"></div>
+            <div id="tick-1" class="gauge-tick tick-1" style="left: 68%" title="一级预警 350k (68%)"></div>
+            <div id="tick-2" class="gauge-tick tick-2" style="left: 82%" title="二级紧急 420k (82%)"></div>
+          </div>
+          <div class="gauge-labels">
+            <span>0</span>
+            <span id="tick-label-1" class="tick-label" style="left: 68%">350k</span>
+            <span id="tick-label-2" class="tick-label" style="left: 82%">420k</span>
+            <span id="tick-label-max">512k</span>
+          </div>
+        </div>
+
+        <div id="usage-sub" class="usage-sub">等待首轮模型响应 token 统计…</div>
+      </section>
+
+      <section class="card cache-card" aria-label="缓存命中与模型统计">
+        <div class="card-head">
+          <span class="card-title">缓存命中与模型</span>
+          <div class="cache-head-right">
+            <span id="cache-hit-pill" class="hit-pill hidden" data-testid="cache-hit-pill">--</span>
+            <span id="model-count-tag" class="muted-tag">--</span>
+          </div>
+        </div>
+
+        <div id="model-list" class="model-list" data-testid="model-list"></div>
+
+        <div id="session-total-box" class="session-total-box hidden" data-testid="session-total-box">
+          <div class="subsection-head">
+            <span class="subsection-title">全会话合计</span>
+            <span id="session-total-meta" class="muted-tag">--</span>
+          </div>
+          <div id="session-total-line" class="session-total-line"></div>
+        </div>
+      </section>
+
+      <section class="card guard-card" aria-label="Context Guard linkage">
+        <div class="card-head">
+          <span class="card-title">Context Guard 联动</span>
+          <span id="guard-sync" class="muted-tag">未初始化</span>
+        </div>
+
+        <div class="memory-row">
+          <div class="memory-info">
+            <span id="ts-dot" class="status-dot missing" aria-hidden="true"></span>
+            <div>
+              <div class="memory-name">task_state.md</div>
+              <div id="ts-meta" class="memory-meta">尚未创建工作记忆文件</div>
+            </div>
+          </div>
+          <button id="btn-open-ts" type="button" class="btn ghost sm" disabled>打开</button>
+        </div>
+
+        <div class="actions-row">
+          <button id="btn-copy-compact" type="button" class="btn primary" data-testid="btn-copy-compact">
+            复制 /compact
+          </button>
+          <button id="btn-remind-ts" type="button" class="btn secondary" data-testid="btn-remind-ts">
+            提醒更新记忆
+          </button>
+        </div>
+
+        <div id="ckpt-section" class="ckpt-section hidden">
+          <div class="ckpt-title">压缩历史</div>
+          <ul id="ckpt-list" class="ckpt-list"></ul>
+        </div>
+      </section>
+
+      <button id="comp-summary" type="button" class="card comp-summary-card hidden" aria-label="上下文组成摘要，点击查看详情" data-testid="comp-summary">
+        <div class="card-head">
+          <span class="card-title">上下文组成</span>
+          <span class="summary-cta">详情 <span class="chevron" aria-hidden="true">›</span></span>
+        </div>
+        <div id="comp-mini-headline" class="comp-headline"></div>
+        <div id="comp-mini-bar" class="comp-bar sm" aria-hidden="true"></div>
+        <div id="comp-mini-legend" class="comp-mini-legend"></div>
+        <div id="comp-mini-meta" class="comp-mini-meta"></div>
+      </button>
+    </main>
+
+    <section id="model-detail" class="dashboard hidden" aria-label="Model detail view" data-testid="model-detail">
+      <div class="detail-topbar">
+        <button id="btn-back-overview" type="button" class="btn ghost sm" data-testid="btn-back-overview">← 返回总览</button>
+        <span id="detail-model-meta" class="muted-tag">--</span>
+      </div>
+
+      <section class="card">
+        <div class="card-head">
+          <span id="detail-model-name" class="detail-title">--</span>
+          <span id="detail-model-hit-pill" class="hit-pill">--</span>
+        </div>
+        <div id="detail-model-sub" class="usage-sub">--</div>
+        <div class="stat-grid">
+          <div class="stat">
+            <span class="stat-k">调用次数（全会话 / 本周期）</span>
+            <span id="detail-calls" class="stat-v">--</span>
+          </div>
+          <div class="stat">
+            <span class="stat-k">缓存命中率 / 归零次数</span>
+            <span id="detail-hit-miss" class="stat-v">--</span>
+          </div>
+          <div class="stat">
+            <span class="stat-k">未命中输入（总 / 均步）</span>
+            <span id="detail-in" class="stat-v">--</span>
+          </div>
+          <div class="stat">
+            <span class="stat-k">缓存读取（总 / 均步）</span>
+            <span id="detail-cr" class="stat-v">--</span>
+          </div>
+          <div class="stat">
+            <span class="stat-k">输出 Token（总 / 均步）</span>
+            <span id="detail-out" class="stat-v">--</span>
+          </div>
+          <div class="stat">
+            <span class="stat-k">最大 / 末次上下文</span>
+            <span id="detail-ctx" class="stat-v">--</span>
+          </div>
+          <div class="stat">
+            <span class="stat-k">输出速度 TPS（均 / 末次）</span>
+            <span id="detail-tps" class="stat-v">--</span>
+          </div>
+          <div class="stat">
+            <span class="stat-k">平均首响 / 总生成耗时</span>
+            <span id="detail-timing" class="stat-v">--</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <span class="card-title">该模型分步调用明细</span>
+          <span id="detail-steps-count" class="muted-tag">--</span>
+        </div>
+        <div id="detail-steps-list" class="detail-steps-list" data-testid="detail-steps-list"></div>
+      </section>
+    </section>
+
+    <section id="breakdown-detail" class="dashboard hidden" aria-label="上下文组成与工具详情" data-testid="breakdown-detail">
+      <div class="detail-topbar">
+        <button id="btn-back-breakdown" type="button" class="btn ghost sm" data-testid="btn-back-breakdown">← 返回总览</button>
+        <div class="seg-toggle" role="tablist" aria-label="统计范围">
+          <button id="comp-scope-window" type="button" role="tab" class="seg-btn active" aria-selected="true" data-scope="window">当前窗口</button>
+          <button id="comp-scope-total" type="button" role="tab" class="seg-btn" aria-selected="false" data-scope="total">全对话</button>
+        </div>
+      </div>
+
+      <section id="comp-card" class="card comp-card hidden" aria-label="上下文构成" data-testid="comp-card">
+        <div class="card-head">
+          <span class="card-title">上下文构成明细</span>
+          <span id="comp-scope-tag" class="muted-tag">当前窗口</span>
+        </div>
+        <div id="comp-headline" class="comp-headline" data-testid="comp-headline"></div>
+        <div id="comp-bar" class="comp-bar" role="img" aria-label="上下文构成分布条" data-testid="comp-bar"></div>
+        <ul id="comp-legend" class="comp-legend" data-testid="comp-legend"></ul>
+        <div id="comp-foot" class="comp-foot"></div>
+      </section>
+
+      <section id="tools-card" class="card tools-card hidden" aria-label="工具与 Skill 使用" data-testid="tools-card">
+        <div class="card-head">
+          <span class="card-title">工具与 Skill 使用</span>
+          <span id="tools-meta" class="muted-tag">--</span>
+        </div>
+        <div class="tool-key" aria-hidden="true">
+          <span><i class="key-dot g-tool"></i>结果占用</span>
+          <span><i class="key-dot g-args"></i>参数占用</span>
+        </div>
+        <ul id="tool-list" class="tool-list" data-testid="tool-list"></ul>
+        <button id="tool-more" type="button" class="link-btn hidden"></button>
+        <div class="chip-block">
+          <div class="chip-title">Skill</div>
+          <div id="skill-chips" class="chips" data-testid="skill-chips"></div>
+        </div>
+        <div id="mcp-block" class="chip-block hidden">
+          <div class="chip-title">MCP</div>
+          <div id="mcp-chips" class="chips"></div>
+        </div>
+      </section>
+    </section>
+
+    <section id="empty-state" class="empty-state">
+      <div class="empty-card">
+        <div class="empty-title">等待对话上下文数据</div>
+        <div id="empty-desc" class="empty-desc">正在关联当前会话的 transcript 与 Context Guard 状态…</div>
+      </div>
+    </section>
+  </div>
+
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

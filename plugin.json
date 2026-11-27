@@ -1,0 +1,17 @@
+{
+  "name": "context-guard",
+  "displayName": "Context Guard",
+  "version": "1.5.0",
+  "author": {
+    "name": "uoesyl",
+    "url": "https://github.com/uoesyl"
+  },
+  "homepage": "https://github.com/uoesyl/context-guard",
+  "repository": "https://github.com/uoesyl/context-guard",
+  "description": "Real-time context window usage meter, model-aware pre-compaction warnings, and lossless post-compaction recovery (verbatim user requests + task_state.md) for Antigravity.",
+  "suggestedPrompts": [
+    "Check current context window usage and task_state.md status",
+    "Recall earlier user requirements from transcript_full.jsonl",
+    "Show what is using this conversation's context, plus tool and skill usage"
+  ]
+}
