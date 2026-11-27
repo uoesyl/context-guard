@@ -17,6 +17,10 @@ import os
 import shutil
 import sys
 
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 GUARD = os.path.join(HERE, "hooks", "guard.py")
 KEY = "context-guard"

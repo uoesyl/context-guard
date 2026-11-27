@@ -8,8 +8,6 @@
     snap: null,
     selectedModelKey: null,
     showBreakdown: false,
-    toastTimer: null,
-    remindConfirmUntil: 0,
     compScope: 'window',
     compOpen: new Set(),
     compOpenInit: false,
@@ -82,14 +80,6 @@
     if (mins < 60) return `${mins} 分钟前`;
     const hrs = Math.round(mins / 60);
     return `${hrs} 小时前`;
-  }
-
-  function showToast(msg) {
-    const el = $('toast');
-    el.textContent = msg;
-    el.classList.remove('hidden');
-    clearTimeout(state.toastTimer);
-    state.toastTimer = setTimeout(() => el.classList.add('hidden'), 2400);
   }
 
   function hitClass(rate) {
@@ -722,6 +712,7 @@
       hitPill.className = 'hit-pill hidden';
     }
 
+    renderCacheActivity(snap);
     renderModelList(snap.models, snap.models?.activeModel);
 
     const totBox = $('session-total-box');
@@ -795,6 +786,39 @@
     renderBreakdownSummary(snap.breakdown);
   }
 
+  function renderCacheActivity(snap) {
+    const box = $('cache-activity');
+    const line = $('cache-activity-line');
+    const hint = $('cache-compact-hint');
+    if (!box || !line || !hint) return;
+    const act = snap?.models?.activity;
+    const recentHit = snap?.trend?.recentCacheHitRate;
+    const compCount = snap?.compaction?.count || 0;
+    if (act?.lastStepAtMs && act?.lastModel) {
+      box.classList.remove('hidden');
+      const parts = [`上次调用 ${fmtAgo(act.lastStepAtMs)}（${act.lastModel}）`];
+      if (Number.isFinite(recentHit)) {
+        parts.push(`近期命中 ${fmtPct(recentHit)}`);
+      } else if (Number.isFinite(act.lastCacheHitRate)) {
+        parts.push(`末步命中 ${fmtPct(act.lastCacheHitRate)}`);
+      }
+      line.textContent = parts.join(' · ');
+      if (act.crossModelCompactRisk) {
+        hint.textContent = `提示：当前处于 ${act.lastModel} 执行态，此刻直接 /compact 可能因跨模型导致 0 缓存命中`;
+        hint.classList.remove('hidden');
+      } else {
+        hint.classList.add('hidden');
+      }
+    } else if (compCount > 0) {
+      box.classList.remove('hidden');
+      line.textContent = '刚完成压缩，等待本周期首轮模型调用';
+      hint.classList.add('hidden');
+    } else {
+      box.classList.add('hidden');
+      hint.classList.add('hidden');
+    }
+  }
+
   async function poll() {
     const conv = currentConv();
     if (!conv) {
@@ -806,7 +830,10 @@
       const data = await apiFetch(`/api/context?${qs.toString()}`);
       $('live-pill').classList.remove('stale');
       $('live-text').textContent = 'Live';
-      if (data.unchanged) return;
+      if (data.unchanged) {
+        if (state.snap) renderCacheActivity(state.snap);
+        return;
+      }
       state.etag = data.etag || '';
       render(data);
     } catch {
@@ -824,54 +851,6 @@
     const uri = state.snap?.taskState?.uri;
     if (!uri) return;
     window.sidecar?.ui?.toggleAuxPane({ tabType: 'fileView', uri });
-  });
-
-  $('btn-copy-compact').addEventListener('click', async () => {
-    try {
-      await navigator.clipboard.writeText('/compact');
-      showToast('已复制 /compact，请在对话输入框粘贴发送');
-    } catch {
-      const ta = document.createElement('textarea');
-      ta.value = '/compact';
-      ta.style.position = 'fixed';
-      ta.style.opacity = '0';
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand('copy');
-      ta.remove();
-      showToast('已复制 /compact，请在对话输入框粘贴发送');
-    }
-  });
-
-  $('btn-remind-ts').addEventListener('click', async () => {
-    const conv = currentConv();
-    if (!conv) return;
-    const now = Date.now();
-    const btn = $('btn-remind-ts');
-    if (now > state.remindConfirmUntil) {
-      state.remindConfirmUntil = now + 4000;
-      btn.textContent = '再次点击确认发送';
-      setTimeout(() => {
-        if (Date.now() > state.remindConfirmUntil) btn.textContent = '提醒更新记忆';
-      }, 4100);
-      return;
-    }
-    state.remindConfirmUntil = 0;
-    btn.textContent = '发送中…';
-    btn.disabled = true;
-    try {
-      await apiFetch('/api/actions/remind-state', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ conversationId: conv }),
-      });
-      showToast('已向当前对话发送更新 task_state.md 提醒');
-    } catch (err) {
-      showToast(`发送失败: ${err.message}`);
-    } finally {
-      btn.textContent = '提醒更新记忆';
-      btn.disabled = false;
-    }
   });
 
   poll();

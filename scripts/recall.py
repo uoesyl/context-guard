@@ -18,7 +18,9 @@ import re
 import sys
 import time
 
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks"))
 import common as C  # noqa: E402
 
@@ -140,9 +142,10 @@ def main():
         if not out:
             out.append("（无）")
     elif a.cmd == "messages":
-        col = C.AgentCollector()
+        col = C.AgentCollector(conv_dir=C.conv_dir_for_transcript(path))
         for o in rows:
             col.feed(o)
+        col.load_board_files()
         f = (a.sender or "").lower()
         ok = lambda who: not f or str(who).lower().startswith(f)  # noqa: E731
         out.append("## 收到的代理消息")

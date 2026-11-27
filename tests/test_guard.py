@@ -12,11 +12,16 @@ import glob
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 PLUGIN = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GUARD = os.path.join(PLUGIN, "hooks", "guard.py")
@@ -144,7 +149,7 @@ def multi_agent_tests():
     d = os.path.join(TMP, "late_worker", ".system_generated", "logs")
     os.makedirs(d, exist_ok=True)
     dst = os.path.join(d, "transcript_full.jsonl")
-    open(dst, "w").close()
+    open(dst, "w", encoding="utf-8").close()
     pl = {"conversationId": "late_worker", "transcriptPath": dst, "artifactDirectoryPath": TMP}
     r0 = call(dict(pl, hookEventName="PreToolUse", toolCall={"name": "read_file"}))
     r1 = call(dict(pl, hookEventName="PreInvocation"))
@@ -182,8 +187,13 @@ def multi_agent_tests():
 def structure_ok(pack):
     """Every '#' heading line in the pack must belong to the pack's own skeleton."""
     own = ("## Context Guard", "### ")
+    in_board = False
     for ln in pack.splitlines():
+        if ln.startswith("### "):
+            in_board = ln.startswith("### swarm 消息板")
         if ln.startswith("#") and not ln.startswith(own):
+            if in_board and re.match(r"^#\d+ .+:$", ln):
+                continue
             return False, ln
     heads = [ln for ln in pack.splitlines() if ln.startswith("### ")]
     allowed = ("### 用户原话", "### 当前执行计划", "### 最近一次交回", "### 其他代理", "### 你派发过",
@@ -887,6 +897,240 @@ def regression_tests():
         U.feed(u_raw, row)
         U.feed(u_cmp, U.compact_step(row))
     check(u_raw == u_cmp, "usage: compact_step produces identical accounting to raw steps")
+
+    # 13. Item 1: Coordinator board.jsonl, Worker steps/<n>/output.txt + traversal guard, and 42k global cap
+    c_root = os.path.join(TMP, "board-coord")
+    c_logs = os.path.join(c_root, ".system_generated", "logs")
+    c_swarm = os.path.join(c_root, ".system_generated", "swarm")
+    os.makedirs(c_logs, exist_ok=True)
+    os.makedirs(c_swarm, exist_ok=True)
+    c_tr = os.path.join(c_logs, "transcript_full.jsonl")
+    with open(c_tr, "w", encoding="utf-8") as f:
+        for row in [
+            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>协调任务</USER_REQUEST>"},
+            {"step_index": 1, "type": "PLANNER_RESPONSE", "input_tokens": 2000,
+             "tool_calls": [{"name": "read_board", "args": {"since": 0}}]},
+            {"step_index": 2, "type": "GENERIC",
+             "content": "The tool's output was truncated due to being too long. file:///C:/nope/output.txt\n{\"messages\":[]"},
+            {"step_index": 3, "type": "CHECKPOINT", "content": "# Resuming"},
+        ]:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    with open(os.path.join(c_swarm, "board.jsonl"), "w", encoding="utf-8") as f:
+        for seq in range(1, 21):
+            txt = (f"MSG-{seq:02d}-\n# Fake Heading\n### Fake Section\n" + "Z" * 40
+                   if seq == 20 else f"MSG-{seq:02d}-" + "Z" * 80)
+            f.write(json.dumps({"seq": seq, "agent": f"w-{seq % 3}", "text": txt},
+                               ensure_ascii=False) + "\n")
+    pack_coord = guard.build_recovery(c_tr, c_root, 3, "board-coord")
+    check("MSG-20-" in pack_coord and "MSG-06-" in pack_coord and "MSG-05-" not in pack_coord
+          and "> # Fake Heading" in pack_coord and "> ### Fake Section" in pack_coord
+          and structure_ok(pack_coord)[0],
+          "swarm: coordinator reads full board.jsonl and keeps latest 15 messages")
+    r_msg_c = subprocess.run([sys.executable, RECALL, "--transcript", c_tr, "messages"],
+                             capture_output=True, text=True, encoding="utf-8")
+    check(r_msg_c.returncode == 0 and "#20" in r_msg_c.stdout and "MSG-20-" in r_msg_c.stdout,
+          "recall messages: coordinator reads full board.jsonl")
+
+    w_root = os.path.join(TMP, "board-worker")
+    w_logs = os.path.join(w_root, ".system_generated", "logs")
+    w_step5 = os.path.join(w_root, ".system_generated", "steps", "5")
+    w_outside = os.path.join(w_root, "outside")
+    os.makedirs(w_logs, exist_ok=True)
+    os.makedirs(w_step5, exist_ok=True)
+    os.makedirs(w_outside, exist_ok=True)
+    w_out5 = os.path.join(w_step5, "output.txt")
+    with open(w_out5, "w", encoding="utf-8") as f:
+        f.write("Created At: 2026-11-28T00:00:00+08:00\nCompleted At: 2026-11-28T00:00:01+08:00\n")
+        f.write(json.dumps({"messages": [
+            {"seq": 1, "agent": "coordinator", "text": "ASSIGN-1"},
+            {"seq": 2, "agent": "worker", "text": "WORKER-OUT-2"},
+        ]}, ensure_ascii=False) + "\n")
+    w_bad_out = os.path.join(w_outside, "output.txt")
+    with open(w_bad_out, "w", encoding="utf-8") as f:
+        f.write("Created At: x\nCompleted At: y\n" + json.dumps({"messages": [{"seq": 99, "agent": "evil", "text": "OUTSIDE-SECRET"}]}))
+    w_missing = os.path.join(w_root, ".system_generated", "steps", "999", "output.txt")
+    to_uri = lambda p: "file:///" + p.replace("\\", "/").lstrip("/")  # noqa: E731
+    w_tr = os.path.join(w_logs, "transcript_full.jsonl")
+    with open(w_tr, "w", encoding="utf-8") as f:
+        for row in [
+            {"step_index": 0, "type": "SYSTEM_MESSAGE",
+             "content": "[Message] timestamp=2026-11-28T00:00:00Z sender=11111111-1111-1111-1111-111111111111 "
+                        "priority=MESSAGE_PRIORITY_HIGH content=Your assignment (recorded on the board as #1)"},
+            {"step_index": 1, "type": "PLANNER_RESPONSE", "input_tokens": 1000,
+             "tool_calls": [{"name": "read_board", "args": {"since": 0}},
+                            {"name": "read_board", "args": {"since": 0}},
+                            {"name": "read_board", "args": {"since": 0}}]},
+            {"step_index": 2, "type": "GENERIC",
+             "content": f"The tool's output was truncated. See {to_uri(w_out5)}\n" + '{"messages":[{"seq":1}'},
+            {"step_index": 3, "type": "GENERIC",
+             "content": f"The tool's output was truncated. See {to_uri(w_bad_out)}\n"},
+            {"step_index": 4, "type": "GENERIC",
+             "content": f"The tool's output was truncated. See {to_uri(w_missing)}\n"},
+            {"step_index": 5, "type": "CHECKPOINT", "content": "# Resuming"},
+        ]:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    pack_w = guard.build_recovery(w_tr, w_root, 5, "board-worker")
+    check("WORKER-OUT-2" in pack_w and "OUTSIDE-SECRET" not in pack_w and structure_ok(pack_w)[0],
+          "swarm: worker recovers truncated steps/<n>/output.txt and blocks paths outside steps/")
+
+    cap_root = os.path.join(TMP, "cap-42k")
+    cap_logs = os.path.join(cap_root, ".system_generated", "logs")
+    cap_swarm = os.path.join(cap_root, ".system_generated", "swarm")
+    os.makedirs(cap_logs, exist_ok=True)
+    os.makedirs(cap_swarm, exist_ok=True)
+    cap_tr = os.path.join(cap_logs, "transcript_full.jsonl")
+    with open(os.path.join(cap_root, "task_state.md"), "w", encoding="utf-8") as f:
+        f.write("# task_state\nTS-KEEP-MARKER\n" + ("S" * 7400))
+    with open(os.path.join(cap_swarm, "board.jsonl"), "w", encoding="utf-8") as f:
+        for seq in range(1, 16):
+            f.write(json.dumps({"seq": seq, "agent": f"w{seq}", "text": "B" * 1000}) + "\n")
+    with open(cap_tr, "w", encoding="utf-8") as f:
+        s_idx = 0
+        for i in range(45):
+            f.write(json.dumps({"step_index": s_idx, "type": "USER_INPUT",
+                                "content": f"<USER_REQUEST>early-user-{i} " + ("U" * 800) + "</USER_REQUEST>"}) + "\n")
+            s_idx += 1
+        for tag in ("TAIL-USER-A", "TAIL-USER-B", "TAIL-USER-C"):
+            f.write(json.dumps({"step_index": s_idx, "type": "USER_INPUT",
+                                "content": f"<USER_REQUEST>{tag} " + ("T" * 2600) + "</USER_REQUEST>"}) + "\n")
+            s_idx += 1
+        for i in range(12):
+            f.write(json.dumps({"step_index": s_idx, "type": "SYSTEM_MESSAGE",
+                                "content": f"[Message] timestamp=2026-11-28T00:00:00Z sender=22222222-2222-2222-2222-222222222222 "
+                                           f"priority=HIGH content=IN-{i}-" + ("I" * 1000)}) + "\n")
+            s_idx += 1
+        tcs = [{"name": "edit_file", "args": {"Path": f"src/file_{i}.py"}} for i in range(15)]
+        tcs += [{"name": "invoke_subagent", "args": {"Role": f"Sub{i}", "TypeName": "research", "Prompt": "P" * 300}} for i in range(12)]
+        tcs += [{"name": "send_message", "args": {"Recipient": "22222222-2222-2222-2222-222222222222", "Message": "O" * 300}} for i in range(6)]
+        tcs += [{"name": "exit_plan_mode", "args": {"plan": "P" * 4000}},
+                {"name": "enter_plan_mode", "args": {"reason": "R" * 2000}}]
+        f.write(json.dumps({"step_index": s_idx, "type": "PLANNER_RESPONSE", "tool_calls": tcs}) + "\n")
+        s_idx += 1
+        f.write(json.dumps({"step_index": s_idx, "type": "CHECKPOINT", "content": "# Resuming"}) + "\n")
+    pack_cap = guard.build_recovery(cap_tr, cap_root, s_idx, "cap-42k")
+    check(len(pack_cap) <= guard.PACK_MAX_CHARS and structure_ok(pack_cap)[0]
+          and all(tag in pack_cap for tag in ("TAIL-USER-A", "TAIL-USER-B", "TAIL-USER-C", "TS-KEEP-MARKER")),
+          f"global cap: pack len {len(pack_cap)} <= {guard.PACK_MAX_CHARS} while preserving last 3 users & task_state.md")
+
+    # 14. Item 2: task_state.md staleness metadata & Worker rule exclusivity
+    ts_root = os.path.join(TMP, "ts-stale")
+    ts_logs = os.path.join(ts_root, ".system_generated", "logs")
+    os.makedirs(ts_logs, exist_ok=True)
+    ts_file = os.path.join(ts_root, "task_state.md")
+    with open(ts_file, "w", encoding="utf-8") as f:
+        f.write("# task_state\n当前目标：测试\n")
+    t_old = 1764288000  # fixed past epoch
+    os.utime(ts_file, (t_old, t_old))
+    ts_tr_fresh = os.path.join(ts_logs, "transcript_full.jsonl")
+    with open(ts_tr_fresh, "w", encoding="utf-8") as f:
+        for row in [
+            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>hi</USER_REQUEST>"},
+            {"step_index": 10, "type": "PLANNER_RESPONSE", "created_at": "2025-11-28T00:00:00Z",
+             "tool_calls": [{"name": "write_file", "args": {"TargetFile": ts_file}}]},
+            {"step_index": 12, "type": "PLANNER_RESPONSE", "created_at": "2025-11-28T00:01:00Z"},
+            {"step_index": 15, "type": "CHECKPOINT", "content": "# Resuming"},
+        ]:
+            f.write(json.dumps(row) + "\n")
+    pack_fresh = guard.build_recovery(ts_tr_fresh, ts_root, 15, "ts-fresh")
+    check("上次更新于第 10 步，滞后 5 步 / 1 次模型调用" in pack_fresh
+          and "可能已过时" not in pack_fresh and structure_ok(pack_fresh)[0],
+          "task_state staleness: fresh file annotates step/lag with no stale warning")
+
+    with open(ts_tr_fresh, "w", encoding="utf-8") as f:
+        rows_stale = [
+            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>hi</USER_REQUEST>"},
+            {"step_index": 2, "type": "PLANNER_RESPONSE", "created_at": "2025-11-28T00:00:00Z",
+             "tool_calls": [{"name": "write_file", "args": {"TargetFile": ts_file}}]},
+        ]
+        for s_i in range(3, 9):
+            rows_stale.append({"step_index": s_i, "type": "PLANNER_RESPONSE", "created_at": "2025-11-28T00:01:00Z"})
+        rows_stale.append({"step_index": 30, "type": "CHECKPOINT", "content": "# Resuming"})
+        for row in rows_stale:
+            f.write(json.dumps(row) + "\n")
+    pack_stale = guard.build_recovery(ts_tr_fresh, ts_root, 30, "ts-stale")
+    check("上次更新于第 2 步，滞后 28 步 / 6 次模型调用" in pack_stale
+          and "可能已过时" in pack_stale and structure_ok(pack_stale)[0],
+          "task_state staleness: stale file emits strong lag warning")
+
+    t_newer = 1764288000 + 600
+    os.utime(ts_file, (t_newer, t_newer))
+    pack_ext = guard.build_recovery(ts_tr_fresh, ts_root, 30, "ts-ext")
+    check("可能已由命令或外部更新" in pack_ext and "可能已过时" not in pack_ext and structure_ok(pack_ext)[0],
+          "task_state staleness: newer disk mtime avoids false stale warning")
+
+    sw_excl_d = os.path.join(TMP, "swarm-worker-excl", ".system_generated", "logs")
+    os.makedirs(sw_excl_d, exist_ok=True)
+    shutil.copy(os.path.join(FIX, "swarm_worker.jsonl"), os.path.join(sw_excl_d, "transcript_full.jsonl"))
+    worker_rule_msg = text_of(call({
+        "conversationId": "swarm-worker-excl",
+        "transcriptPath": os.path.join(sw_excl_d, "transcript.jsonl"),
+        "artifactDirectoryPath": os.path.join(TMP, "swarm-worker-excl"),
+        "hookEventName": "PreInvocation",
+    }))
+    check("严禁改写 Coordinator 或其他会话的 task_state.md" in worker_rule_msg,
+          "swarm worker: rule footer forbids overwriting Coordinator task_state.md")
+
+    # 15. Item 4: Conditional monotonic warning lock (Plan<->Execute switch, legacy state, rewind)
+    saved_cal = K.load(guard.DATA_DIR)
+    K.save(guard.DATA_DIR, {"models": {
+        "neon-plan": {"samples": [{"tokens": 517000, "conv": "sw", "step": 100}]},
+        "hydro-exec": {"override": 512000},
+    }})
+    dst_sw, pl_sw = _mini_conv("warn-switch", [
+        {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>plan</USER_REQUEST>"},
+        {"step_index": 1, "type": "PLANNER_RESPONSE", "model": "neon-plan", "input_tokens": 200000},
+    ])
+    call(dict(pl_sw, hookEventName="PreInvocation"))
+    _append(dst_sw, {"step_index": 2, "type": "PLANNER_RESPONSE", "model": "neon-plan", "input_tokens": 448000})
+    w_sw1 = text_of(call(dict(pl_sw, hookEventName="PreInvocation")))
+    _append(dst_sw, {"step_index": 3, "type": "PLANNER_RESPONSE", "model": "hydro-exec", "input_tokens": 408000})
+    w_sw2 = text_of(call(dict(pl_sw, hookEventName="PreInvocation")))
+    _append(dst_sw, {"step_index": 4, "type": "PLANNER_RESPONSE", "model": "hydro-exec", "input_tokens": 425000})
+    w_sw3 = text_of(call(dict(pl_sw, hookEventName="PreInvocation")))
+    _append(dst_sw, {"step_index": 5, "type": "PLANNER_RESPONSE", "model": "neon-plan", "input_tokens": 431000})
+    w_sw4 = text_of(call(dict(pl_sw, hookEventName="PreInvocation")))
+    check("Context Guard 紧急" in w_sw1 and not w_sw2 and not w_sw3 and not w_sw4,
+          "warn lock: Plan<->Execute model switch does not re-trigger L2 warning")
+
+    # Legacy state without warned_target
+    st_leg = guard.load_state("warn-switch")
+    st_leg.pop("warned_target", None)
+    guard.save_state("warn-switch", st_leg)
+    _append(dst_sw, {"step_index": 6, "type": "PLANNER_RESPONSE", "model": "hydro-exec", "input_tokens": 405000})
+    w_leg1 = text_of(call(dict(pl_sw, hookEventName="PreInvocation")))
+    _append(dst_sw, {"step_index": 7, "type": "PLANNER_RESPONSE", "model": "hydro-exec", "input_tokens": 425000})
+    w_leg2 = text_of(call(dict(pl_sw, hookEventName="PreInvocation")))
+    check(not w_leg1 and not w_leg2 and guard.load_state("warn-switch").get("warned_target") is not None,
+          "warn lock: legacy state without warned_target also avoids duplicate L2 and backfills warned_target")
+
+    # Rewind unlocks warning when new post-rewind prompt is smaller, and warns again once threshold crossed
+    _append(dst_sw, {"step_index": 1, "type": "USER_INPUT", "content": "<USER_REQUEST>edited prompt</USER_REQUEST>"})
+    w_rw0 = text_of(call(dict(pl_sw, hookEventName="PreInvocation")))
+    _append(dst_sw, {"step_index": 2, "type": "PLANNER_RESPONSE", "model": "hydro-exec", "input_tokens": 80000})
+    w_rw1 = text_of(call(dict(pl_sw, hookEventName="PreInvocation")))
+    st_rw = guard.load_state("warn-switch")
+    _append(dst_sw, {"step_index": 3, "type": "PLANNER_RESPONSE", "model": "hydro-exec", "input_tokens": 360000})
+    w_rw2 = text_of(call(dict(pl_sw, hookEventName="PreInvocation")))
+    check(not w_rw0 and not w_rw1 and st_rw.get("model_warned") == 0 and "Context Guard 预警" in w_rw2,
+          "warn lock: rewind resets warning level after smaller prompt and allows re-warning later")
+    K.save(guard.DATA_DIR, saved_cal)
+
+    # 16. Item 5: CLI UTF-8 stderr/stdout under non-UTF8 console encoding (no PYTHONUTF8=1 injection)
+    r_miss_cs = subprocess.run([sys.executable, "-B", stats_script, "--transcript", os.path.join(TMP, "missing.jsonl")],
+                               capture_output=True)
+    check(r_miss_cs.returncode != 0 and "找不到".encode("utf-8") in r_miss_cs.stderr,
+          "context_stats: missing transcript emits valid UTF-8 stderr without encoding crash")
+    cn_dir = os.path.join(TMP, "中文会话", ".system_generated", "logs")
+    os.makedirs(cn_dir, exist_ok=True)
+    cn_tr = os.path.join(cn_dir, "transcript_full.jsonl")
+    with open(cn_tr, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>测试中文</USER_REQUEST>"}, ensure_ascii=False) + "\n")
+        f.write(json.dumps({"step_index": 1, "type": "PLANNER_RESPONSE", "input_tokens": 1000,
+                            "tool_calls": [{"name": "read_file", "args": {"Path": "中文.py"}}]}, ensure_ascii=False) + "\n")
+    r_json_cs = subprocess.run([sys.executable, "-B", stats_script, "--transcript", cn_tr, "--json"],
+                               capture_output=True)
+    check(r_json_cs.returncode == 0 and json.loads(r_json_cs.stdout.decode("utf-8")).get("window", {}).get("prompt") == 1000,
+          "context_stats: --json handles non-ASCII paths cleanly on stdout")
 
 
 def main():

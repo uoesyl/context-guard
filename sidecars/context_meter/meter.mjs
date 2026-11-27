@@ -274,7 +274,8 @@ function extractStepTiming(buf) {
   }
   const durationSec = tStart && tEnd && tEnd > tStart ? Math.round((tEnd - tStart) * 1000) / 1000 : null;
   const ttftSec = tStart && tFirst && tFirst >= tStart ? Math.round((tFirst - tStart) * 1000) / 1000 : null;
-  return { durationSec, ttftSec };
+  const endAtMs = tEnd ? Math.round(tEnd * 1000) : null;
+  return { durationSec, ttftSec, endAtMs };
 }
 
 export function readStepModels(dbPath, cache = new Map()) {
@@ -944,6 +945,8 @@ function aggregateModels(stepEvents, stepModelMap, currentCycleIndex, sessionTot
   let allDurationSec = 0;
   let lastTps = null;
   let lastDurationSec = null;
+  let cycleLastActivity = null;
+  const cycleModels = new Set();
 
   // One row per model id as written in the transcript (`model`, e.g. gemini-2.5-pro-high).
   // The DB only fills in metadata (enum, timing, context limit): keying rows by the DB enum
@@ -1059,6 +1062,19 @@ function aggregateModels(stepEvents, stepModelMap, currentCycleIndex, sessionTot
       variant,
     });
     activeModel = { key, name: entry.name, modelEnum, variant };
+    if (ev.cycleIndex === currentCycleIndex) {
+      const parsedCreated = ev.createdAt ? Date.parse(ev.createdAt) : NaN;
+      const atMs = Number.isFinite(meta?.endAtMs) && meta.endAtMs > 0
+        ? meta.endAtMs
+        : (Number.isFinite(parsedCreated) && parsedCreated > 0 ? parsedCreated : null);
+      cycleLastActivity = {
+        model: entry.name,
+        step: ev.step,
+        atMs,
+        cacheHitRate: ev.cacheHitRate,
+      };
+      if (entry.name && entry.name !== 'unknown') cycleModels.add(entry.name);
+    }
   }
 
   const totalPrompt = sessionTotals.promptTokens || 0;
@@ -1092,10 +1108,22 @@ function aggregateModels(stepEvents, stepModelMap, currentCycleIndex, sessionTot
     }))
     .sort((a, b) => b.promptTokens - a.promptTokens || b.steps - a.steps);
 
+  const lastActivityModel = cycleLastActivity?.model || null;
+  const isHydrogen = Boolean(lastActivityModel && /hydrogen/i.test(lastActivityModel));
+  const hasPlannerInCycle = [...cycleModels].some((m) => !/hydrogen/i.test(m));
+
   return {
     activeModel,
     lastTps,
     lastDurationSec,
+    activity: {
+      lastModel: lastActivityModel,
+      lastStep: cycleLastActivity?.step ?? null,
+      lastStepAtMs: cycleLastActivity?.atMs ?? null,
+      lastCacheHitRate: cycleLastActivity?.cacheHitRate ?? null,
+      cycleModels: [...cycleModels],
+      crossModelCompactRisk: Boolean(isHydrogen && hasPlannerInCycle),
+    },
     list,
     totals: {
       ...sessionTotals,

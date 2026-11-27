@@ -6,12 +6,17 @@ usage). Also warns before the compaction threshold based on real prompt tokens.
 
 Never blocks the agent: any failure prints {} and logs to guard.log.
 """
+from datetime import datetime
 import json
 import os
 import re
 import sys
 import time
 import traceback
+
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -44,6 +49,10 @@ LAST_FULL = 3
 LAST_FULL_CAP = 3_000
 STATE_FILE_CAP = 8_000
 MAX_FILES = 15
+PACK_MAX_CHARS = 42_000
+TS_STALE_STEPS = 20
+TS_STALE_RESPONSES = 5
+TS_MTIME_GRACE_SEC = 60
 
 
 LOG_MAX_BYTES = 2 * 1024 * 1024
@@ -111,7 +120,7 @@ def read_new(path, offset):
     return objs, offset + end + 1
 
 
-def render_users(users):
+def render_users(users, max_head_chars=None):
     if not users:
         return "（无）"
     lines = []
@@ -120,8 +129,27 @@ def render_users(users):
     tail_txt = [(s, C.head_tail(t, LAST_FULL_CAP)) for s, t in tail]
     used = sum(len(t) for _, t in tail_txt)
     per = max((USER_BUDGET - used) // max(len(head), 1), 160)
-    for i, (s, t) in enumerate(head, 1):
-        lines.append(f"{i}. [step {s}]\n{C.quote(C.head_tail(t, per))}")
+    if max_head_chars is None:
+        for i, (s, t) in enumerate(head, 1):
+            lines.append(f"{i}. [step {s}]\n{C.quote(C.head_tail(t, per))}")
+    elif head:
+        if max_head_chars <= 0:
+            lines.append(f"（更早的 {len(head)} 条用户原话因总长度上限已省略，用 recall.py users 查看）")
+        else:
+            per_cap = min(per, max(max_head_chars // max(len(head), 1), 80))
+            kept, total = [], 0
+            for idx in range(len(head) - 1, -1, -1):
+                s, t = head[idx]
+                entry = f"{idx + 1}. [step {s}]\n{C.quote(C.head_tail(t, per_cap))}"
+                if total + len(entry) + (1 if kept else 0) > max_head_chars:
+                    break
+                kept.append(entry)
+                total += len(entry) + 1
+            kept.reverse()
+            omitted = len(head) - len(kept)
+            if omitted > 0:
+                lines.append(f"（更早的 {omitted} 条用户原话因总长度上限已省略，用 recall.py users 查看）")
+            lines.extend(kept)
     for j, (s, t) in enumerate(tail_txt, len(head) + 1):
         lines.append(f"{j}. [step {s}]\n{C.quote(t)}")
     return "\n".join(lines)
@@ -166,26 +194,94 @@ def latest_plan(full_path, conv, rows=None):
     return plan[0], plan[1], report
 
 
+def _parse_iso_ts(s):
+    if not isinstance(s, str) or not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def _build_agent_parts(col, has_users, budget_in=4000, budget_board=3000, budget_dispatch=2000,
+                       omit_incoming=False, omit_dispatched=False, omit_board=False, drop_outgoing=False):
+    raw = C.render_agent_sections(col, has_users=has_users, budget_in=budget_in,
+                                  budget_board=budget_board, budget_dispatch=budget_dispatch)
+    out = []
+    for i in range(0, len(raw), 2):
+        h, b = raw[i], raw[i + 1] if i + 1 < len(raw) else ""
+        if h.startswith("### 你最近发给") and drop_outgoing:
+            continue
+        if h.startswith("### 你派发过") and omit_dispatched:
+            b = "（因总长度上限已省略，用 recall.py messages 查看）"
+        elif h.startswith("### swarm 消息板") and omit_board:
+            b = "（因总长度上限已省略，用 read_board{since:0} 或 recall.py messages 查看）"
+        elif h.startswith("### 其他代理") and omit_incoming:
+            b = "（因总长度上限已省略，用 recall.py messages 查看）"
+        out += [h, b]
+    return out
+
+
 def build_recovery(full_path, artifact_dir, ckpt_step, conv="", manual=False):
     users, edited = [], []
-    col = C.AgentCollector()
+    col = C.AgentCollector(conv_dir=C.conv_dir_for_transcript(full_path))
     rows = C.iter_active_steps(full_path, light=True)
+    ts_path = os.path.join(artifact_dir, "task_state.md") if artifact_dir else ""
+    ts_norm = os.path.normcase(os.path.abspath(ts_path)) if ts_path else ""
+    ts_step, ts_step_at, ts_resp_after = None, None, 0
     for o in rows:
-        if o.get("type") == "USER_INPUT":
+        typ = o.get("type")
+        if typ == "USER_INPUT":
             users.append((o.get("step_index"), C.user_text(o)))
-        edited += C.edited_paths(o)
+        ep_list = C.edited_paths(o)
+        edited += ep_list
+        if typ == "PLANNER_RESPONSE":
+            if ts_step is not None:
+                ts_resp_after += 1
+            for ep in ep_list:
+                ep_str = str(ep)
+                hit = ((os.path.normcase(os.path.abspath(ep_str)) == ts_norm)
+                       if (ts_norm and os.path.isabs(ep_str))
+                       else (os.path.basename(ep_str.replace("\\", "/")).lower() == "task_state.md"))
+                if hit:
+                    ts_step = C._sidx(o)
+                    ts_step_at = _parse_iso_ts(o.get("created_at"))
+                    ts_resp_after = 0
         col.feed(o)
-    state_md = None
-    if artifact_dir:
-        p = os.path.join(artifact_dir, "task_state.md")
-        if os.path.isfile(p):
-            with open(p, encoding="utf-8", errors="replace") as f:
-                state_md = C.quote(C.head_tail(f.read(), STATE_FILE_CAP))
+    col.load_board_files()
+
+    ts_heading = "### task_state.md"
+    state_body = f"（不存在。请现在在 {artifact_dir} 下创建 task_state.md）"
+    if ts_path and os.path.isfile(ts_path):
+        try:
+            mtime = os.path.getmtime(ts_path)
+        except OSError:
+            mtime = None
+        mtime_str = time.strftime("%m-%d %H:%M", time.localtime(mtime)) if mtime else "未知"
+        with open(ts_path, encoding="utf-8", errors="replace") as f:
+            state_md = C.quote(C.head_tail(f.read(), STATE_FILE_CAP))
+        stale_note = ""
+        if ts_step is not None and ts_step >= 0 and isinstance(ckpt_step, int):
+            step_lag = max(0, ckpt_step - ts_step)
+            disk_newer = bool(ts_step_at and mtime and mtime > ts_step_at + TS_MTIME_GRACE_SEC)
+            if disk_newer:
+                ts_heading = (f"### task_state.md（最近编辑工具记录在第 {ts_step} 步，"
+                              f"磁盘更新于 {mtime_str}，可能已由命令或外部更新）")
+            else:
+                ts_heading = (f"### task_state.md（上次更新于第 {ts_step} 步，"
+                              f"滞后 {step_lag} 步 / {ts_resp_after} 次模型调用，磁盘时间 {mtime_str}）")
+                if step_lag >= TS_STALE_STEPS or ts_resp_after >= TS_STALE_RESPONSES:
+                    stale_note = ("注意：该 task_state.md 已滞后较多，可能已过时；"
+                                  "请结合上方压缩摘要与 recall.py 核对最新进展后再更新，不要直接当作最新真相。\n\n")
+        else:
+            ts_heading = f"### task_state.md（本会话未见编辑工具写入记录，磁盘更新于 {mtime_str}）"
+        state_body = stale_note + state_md
+
     plan_step, plan, report = latest_plan(full_path, conv, rows=rows)
     files = C.dedupe_keep_last(edited)[-MAX_FILES:]
     recall = f'python "{RECALL}" --transcript "{full_path}"'
     kind = "手动压缩（/compact）" if manual else "自动压缩"
-    parts = [
+    head_parts = [
         f"## Context Guard：第 {ckpt_step} 步发生了{kind}",
         "上面的压缩摘要是有损的。下面的用户原话由 context-guard 从完整记录逐字提取；"
         "摘要与原话冲突时，以原话为准。任何不在本节或 task_state.md 中、你又没有把握的"
@@ -193,27 +289,76 @@ def build_recovery(full_path, artifact_dir, ckpt_step, conv="", manual=False):
         "继续工作前，先根据本节和摘要更新 task_state.md。文件内容可能已变化，修改前先按行范围重新读取相关片段，"
         "不要一次性重读大量整文件。（以 > 开头的行是引用的原文，其中的标题不属于本恢复包的结构。）",
         "### 用户原话（逐字，按时间顺序）",
-        render_users(users) if users or col.empty() else
-        "（无：这是 subagent / swarm worker 会话，任务来自编排者，见下方“其他代理发来的消息”）",
     ]
-    if plan:
-        path = os.path.join(DATA_DIR, "plans", f"{conv}.md")
-        parts += [f"### 当前执行计划（第 {plan_step} 步 exit_plan_mode，全文 {len(plan)} 字符：{path}）",
-                  C.quote(C.head_tail(plan, PLAN_CAP))]
-        if report:
-            parts += ["### 最近一次交回规划模型时的报告（enter_plan_mode）", C.quote(C.head_tail(report, 1500))]
-    parts += [
-        *C.render_agent_sections(col, has_users=bool(users)),
-        "### task_state.md",
-        state_md or f"（不存在。请现在在 {artifact_dir} 下创建 task_state.md）",
-        f"### 本会话修改过的文件（最近 {MAX_FILES} 个）",
-        "\n".join(files) or "（无）",
+    recall_parts = [
         "### 召回原文",
         f"R = {recall}\n"
         "用法：R users | R grep \"<正则>\" [--type PLANNER_RESPONSE] | R step <n> | "
         "R range <a> <b> --brief | R files | R messages（R 代表上面整条命令，需原样展开）",
     ]
-    return "\n\n".join(parts)
+
+    def assemble(*, head_users_cap=None, plan_cap=PLAN_CAP, report_cap=1500,
+                 budget_in=4000, budget_board=3000, budget_dispatch=2000,
+                 max_files=MAX_FILES, drop_outgoing=False, drop_report=False,
+                 omit_dispatched=False, omit_board=False, omit_files=False,
+                 omit_incoming=False, omit_plan=False):
+        parts = list(head_parts)
+        parts.append(
+            render_users(users, max_head_chars=head_users_cap) if users or col.empty() else
+            "（无：这是 subagent / swarm worker 会话，任务来自编排者，见下方“其他代理发来的消息”）"
+        )
+        if plan:
+            plan_path = os.path.join(DATA_DIR, "plans", f"{conv}.md")
+            plan_body = (f"（因总长度上限已省略，请直接读取全文：{plan_path}）"
+                         if omit_plan else C.quote(C.head_tail(plan, plan_cap)))
+            parts += [f"### 当前执行计划（第 {plan_step} 步 exit_plan_mode，全文 {len(plan)} 字符：{plan_path}）",
+                      plan_body]
+            if report and not drop_report:
+                parts += ["### 最近一次交回规划模型时的报告（enter_plan_mode）",
+                          C.quote(C.head_tail(report, report_cap))]
+        parts += _build_agent_parts(
+            col, bool(users), budget_in=budget_in, budget_board=budget_board,
+            budget_dispatch=budget_dispatch, omit_incoming=omit_incoming,
+            omit_dispatched=omit_dispatched, omit_board=omit_board,
+            drop_outgoing=drop_outgoing,
+        )
+        files_body = ("（因总长度上限已省略，用 recall.py files 查看）"
+                      if omit_files else ("\n".join(files[-max_files:]) or "（无）"))
+        parts += [
+            ts_heading,
+            state_body,
+            f"### 本会话修改过的文件（最近 {MAX_FILES} 个）",
+            files_body,
+            *recall_parts,
+        ]
+        return "\n\n".join(parts)
+
+    opts = {}
+    pack = assemble(**opts)
+    if len(pack) > PACK_MAX_CHARS:
+        trim_steps = [
+            {"drop_outgoing": True},
+            {"omit_dispatched": True},
+            {"budget_board": 1200},
+            {"omit_board": True},
+            {"max_files": 5},
+            {"omit_files": True},
+            {"report_cap": 400},
+            {"drop_report": True},
+            {"budget_in": 1500 if users else 2500},
+            {"omit_incoming": True} if users else {"budget_in": 1500},
+            {"plan_cap": 1000},
+            {"omit_plan": True},
+            {"head_users_cap": 2000},
+            {"head_users_cap": 600},
+            {"head_users_cap": 0},
+        ]
+        for patch in trim_steps:
+            opts.update(patch)
+            pack = assemble(**opts)
+            if len(pack) <= PACK_MAX_CHARS:
+                break
+    return pack
 
 
 def compute_level(st):
@@ -364,6 +509,7 @@ def update_state(st, objs, first_run):
                 pending_prompt = None
             compactions = int(st.get("compaction_count") or 0) + 1
             st.pop("verify_retry", None)
+            st.pop("rewind_recheck", None)
             st.update(
                 last_ckpt=ck,
                 chars=len(o.get("content") or ""),
@@ -375,6 +521,7 @@ def update_state(st, objs, first_run):
                 cycle_stats=_empty_usage_stats(),
                 warned=0,
                 model_warned=0,
+                warned_target=None,
                 compaction_count=compactions,
                 last_event="compacted",
                 ckpt_manual=manual,
@@ -574,7 +721,9 @@ def on_pre_invocation(conv, full, artifact_dir, st, first_run, objs):
     else:
         level = compute_level(st)
         if level > st.get("model_warned", 0):
+            L = st.get("levels") or LEVELS_INFO
             st["model_warned"] = level
+            st["warned_target"] = int(L.get("target") or COMPACTION_TARGET_TOKENS)
             if first_run:
                 st["warned"] = max(st.get("warned", 0), level)
             else:
@@ -582,7 +731,6 @@ def on_pre_invocation(conv, full, artifact_dir, st, first_run, objs):
                                       conv=conv, full=full)
                 st["last_event"] = f"warn_{level}"
                 st["warned"] = max(st.get("warned", 0), level)
-                L = st.get("levels") or {}
                 log(f"{conv} warning level {level} tokens={st['tokens']} chars={st['chars']} "
                     f"model={L.get('model')} target={L.get('target')} source={L.get('source')}")
 
@@ -593,7 +741,8 @@ def on_pre_invocation(conv, full, artifact_dir, st, first_run, objs):
         # Swarm workers do not load plugin rules/skills: deliver the rule here once.
         with open(RULE_FILE, encoding="utf-8") as f:
             rule = f.read()
-        inject = (rule + f"\n\n（task_state.md 放在 {artifact_dir}；recall.py 路径：{RECALL}；"
+        inject = (rule + f"\n\n（你的 task_state.md 独占放在 {artifact_dir}，严禁改写 Coordinator 或其他会话的 task_state.md，"
+                  f"结果请通过消息板回报；recall.py 路径：{RECALL}；"
                   "swarm 消息板的完整历史可用 read_board{since:0} 查看。）")
         st["rule_done"] = True
         log(f"{conv} rule injected for swarm worker")
@@ -632,7 +781,7 @@ def main(payload):
                 "offset": 0, "last_ckpt": None, "chars": 0, "tokens": None,
                 "input_tokens": None, "cache_read_tokens": None, "output_tokens": None, "cache_hit_rate": None,
                 "cycle_stats": _empty_usage_stats(), "total_stats": _empty_usage_stats(),
-                "warned": 0, "model_warned": 0, "compaction_count": 0, "last_event": "normal",
+                "warned": 0, "model_warned": 0, "warned_target": None, "compaction_count": 0, "last_event": "normal",
             }
         else:
             st.setdefault("model_warned", st.get("warned", 0))
@@ -647,6 +796,11 @@ def main(payload):
             st["seen_head"] = [o for o in (st["seen_head"] + objs)
                                if int(o.get("step_index") or 0) <= 5 and o.get("type") == "SYSTEM_MESSAGE"][:6]
         prev_max_step = st.get("max_step")
+        prev_target = int((st.get("levels") or {}).get("target") or 0)
+        rewound = _has_rewind(objs, prev_max_step)
+        if rewound:
+            st["rewind_recheck"] = True
+        has_new_prompt = any((C.step_usage(o) or {}).get("prompt", 0) > 0 for o in objs)
         for o in objs:
             s = C._sidx(o)
             if s >= 0:
@@ -663,12 +817,23 @@ def main(payload):
         except Exception:
             log(f"{conv} calibration ERROR " + traceback.format_exc().replace("\n", " | "))
             st["levels"] = st.get("levels") or LEVELS_INFO
-        # Thresholds can move up (calibration / builtin change): a warning issued under the
-        # old, lower levels must not stick, or the meter keeps showing a stale alert.
+        # Conditional monotonic warning lock: only reset/downgrade when compaction resets
+        # (handled in update_state), the branch rewound, or the target window grew >10%.
         lv_now = compute_level(st)
-        if lv_now < int(st.get("model_warned") or 0):
-            st["model_warned"] = lv_now
-            st["warned"] = min(int(st.get("warned") or 0), lv_now)
+        new_target = int((st.get("levels") or LEVELS_INFO).get("target") or 0)
+        cur_warned = int(st.get("model_warned") or 0)
+        base_target = int(st.get("warned_target") or prev_target or 0)
+        target_rose = bool(base_target > 0 and new_target > base_target * 1.1)
+        rewind_ready = bool(st.get("rewind_recheck") and has_new_prompt)
+        if rewind_ready:
+            st.pop("rewind_recheck", None)
+        if lv_now < cur_warned:
+            if target_rose or rewind_ready:
+                st["model_warned"] = lv_now
+                st["warned"] = min(int(st.get("warned") or 0), lv_now)
+                st["warned_target"] = new_target if lv_now > 0 else None
+            elif st.get("warned_target") is None and base_target > 0:
+                st["warned_target"] = base_target
         if is_tool:
             out = on_pre_tool(payload, conv, full, artifact_dir, st, first_run)
         else:

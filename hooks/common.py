@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import urllib.parse
 
 USER_REQ_RE = re.compile(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", re.S)
 MSG_RE = re.compile(
@@ -12,6 +13,40 @@ UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{
 NOISE_PREFIXES = ("[swarm] new board message", "[Notice]")
 EDIT_TOOLS = {"write_file", "edit_file", "replace_file_content", "write_to_file",
               "multi_replace_file_content"}
+BOARD_FILE_MAX_BYTES = 4 * 1024 * 1024
+STEP_OUTPUT_MAX_BYTES = 2 * 1024 * 1024
+TRUNC_OUTPUT_URI_RE = re.compile(r"file://(/[^\s\)\"'\r\n]+?output\.txt)", re.I)
+
+
+def conv_dir_for_transcript(path):
+    """Return <conv> directory if `path` is under <conv>/.system_generated/logs/, else None."""
+    if not path:
+        return None
+    norm = os.path.abspath(os.path.normpath(path))
+    logs_dir = os.path.dirname(norm)
+    sysgen_dir = os.path.dirname(logs_dir)
+    conv_dir = os.path.dirname(sysgen_dir)
+    if (os.path.basename(logs_dir).lower() == "logs"
+            and os.path.basename(sysgen_dir).lower() == ".system_generated"
+            and conv_dir and conv_dir != os.path.dirname(conv_dir)):
+        return conv_dir
+    return None
+
+
+def _file_uri_to_path(raw_path):
+    p = urllib.parse.unquote(raw_path)
+    if re.match(r"^/[A-Za-z]:/", p):
+        p = p[1:]
+    return os.path.normpath(p)
+
+
+def _is_within_dir(candidate, root_dir):
+    try:
+        root_real = os.path.normcase(os.path.realpath(root_dir))
+        cand_real = os.path.normcase(os.path.realpath(candidate))
+        return os.path.commonpath([root_real, cand_real]) == root_real
+    except (OSError, ValueError):
+        return False
 
 
 def resolve_full_transcript(transcript_path, conversation_id=None):
@@ -60,18 +95,17 @@ def _agent_slots(o):
 def _slim_recovery_step(o, keep_generic_content=False):
     typ = o.get("type")
     step = o.get("step_index")
+    created_at = o.get("created_at")
     if typ == "USER_INPUT":
         out = {"type": typ, "step_index": step, "content": o.get("content") or ""}
         if o.get("media"):
             out["media"] = o["media"]
-        return out
-    if typ == "SYSTEM_MESSAGE":
+    elif typ == "SYSTEM_MESSAGE":
         out = {"type": typ, "step_index": step}
         c = o.get("content") or ""
         if "[Message] timestamp=" in c:
             out["content"] = c
-        return out
-    if typ == "PLANNER_RESPONSE":
+    elif typ == "PLANNER_RESPONSE":
         tcs = []
         for tc in o.get("tool_calls") or []:
             if not isinstance(tc, dict):
@@ -91,12 +125,16 @@ def _slim_recovery_step(o, keep_generic_content=False):
         out = {"type": typ, "step_index": step}
         if tcs:
             out["tool_calls"] = tcs
-        return out
-    if typ == "GENERIC":
+    elif typ == "GENERIC":
         if keep_generic_content:
-            return {"type": typ, "step_index": step, "content": o.get("content") or ""}
-        return {"type": typ, "step_index": step}
-    return {"type": typ, "step_index": step}
+            out = {"type": typ, "step_index": step, "content": o.get("content") or ""}
+        else:
+            out = {"type": typ, "step_index": step}
+    else:
+        out = {"type": typ, "step_index": step}
+    if created_at:
+        out["created_at"] = created_at
+    return out
 
 
 def iter_active_steps(path_or_rows, light=False, max_bytes=None, transform=None):
@@ -253,10 +291,87 @@ class AgentCollector:
     board     : swarm board messages seen via read_board (dedup by seq)
     """
 
-    def __init__(self):
+    def __init__(self, conv_dir=None):
         self.incoming, self.outgoing, self.dispatched = [], [], []
         self.board = {}
         self._queue = []
+        self._conv_dir = os.path.realpath(conv_dir) if conv_dir and os.path.isdir(conv_dir) else None
+        self._trunc_board_files = []
+
+    def _parse_board_text(self, text, step):
+        k = text.find('{"messages"')
+        if k < 0 or text[:k].count("\n") > 8:  # tool output header, not embedded text
+            return False
+        try:
+            data, _ = json.JSONDecoder().raw_decode(text[k:])
+        except Exception:
+            return False
+        msgs = data.get("messages")
+        if not isinstance(msgs, list):
+            return False
+        for msg in msgs:
+            if isinstance(msg, dict) and "seq" in msg:
+                seq = msg["seq"]
+                prev = self.board.get(seq)
+                prev_step = (prev["step"] if isinstance(prev, dict)
+                             and isinstance(prev.get("step"), int) and prev["step"] >= 0 else -1)
+                use_step = (step if isinstance(step, int) and step >= 0 and prev_step < 0
+                            else (prev_step if prev_step >= 0 else step))
+                self.board[seq] = {"step": use_step, "seq": seq,
+                                   "agent": msg.get("agent") or "?",
+                                   "text": msg.get("text") or ""}
+        return True
+
+    def load_board_files(self):
+        """Read full board messages from swarm/board.jsonl (coordinator) or truncated step output files (worker)."""
+        if not self._conv_dir:
+            return
+        bp = os.path.join(self._conv_dir, ".system_generated", "swarm", "board.jsonl")
+        if os.path.isfile(bp) and _is_within_dir(bp, self._conv_dir):
+            try:
+                sz = os.path.getsize(bp)
+                with open(bp, "rb") as f:
+                    if sz > BOARD_FILE_MAX_BYTES:
+                        f.seek(sz - BOARD_FILE_MAX_BYTES)
+                        f.readline()  # discard partial first line
+                    for raw in f:
+                        try:
+                            msg = json.loads(raw.decode("utf-8", errors="replace"))
+                        except Exception:
+                            continue
+                        if isinstance(msg, dict) and "seq" in msg:
+                            seq = msg["seq"]
+                            prev = self.board.get(seq)
+                            step = (prev["step"] if isinstance(prev, dict)
+                                    and isinstance(prev.get("step"), int) and prev["step"] >= 0 else -1)
+                            self.board[seq] = {"step": step, "seq": seq,
+                                               "agent": msg.get("agent") or "?",
+                                               "text": msg.get("text") or ""}
+                return
+            except OSError:
+                pass
+        steps_root = os.path.join(self._conv_dir, ".system_generated", "steps")
+        if not os.path.isdir(steps_root):
+            return
+        seen = set()
+        budget = BOARD_FILE_MAX_BYTES
+        for step, fp in reversed(self._trunc_board_files):
+            norm = os.path.normcase(os.path.normpath(fp))
+            if norm in seen:
+                continue
+            seen.add(norm)
+            if not os.path.isfile(fp) or not _is_within_dir(fp, steps_root):
+                continue
+            try:
+                sz = os.path.getsize(fp)
+                if sz <= 0 or sz > STEP_OUTPUT_MAX_BYTES or sz > budget:
+                    continue
+                with open(fp, encoding="utf-8", errors="replace") as f:
+                    txt = f.read(STEP_OUTPUT_MAX_BYTES + 1)
+                budget -= sz
+                self._parse_board_text(txt, step)
+            except OSError:
+                continue
 
     def feed(self, o):
         t, s = o.get("type"), _sidx(o)
@@ -309,17 +424,11 @@ class AgentCollector:
                 if m:
                     target["conv"] = m.group(1)
             elif kind == "board":
-                k = c.find('{"messages"')
-                if k >= 0 and c[:k].count("\n") <= 8:  # tool output header, not embedded text
-                    try:
-                        data, _ = json.JSONDecoder().raw_decode(c[k:])
-                        for msg in data.get("messages") or []:
-                            if isinstance(msg, dict) and "seq" in msg:
-                                self.board[msg["seq"]] = {"step": s, "seq": msg["seq"],
-                                                          "agent": msg.get("agent", "?"),
-                                                          "text": msg.get("text") or ""}
-                    except Exception:
-                        pass
+                ok = self._parse_board_text(c, s)
+                if not ok or "output.txt" in c[:1000]:
+                    m = TRUNC_OUTPUT_URI_RE.search(c[:1000])
+                    if m:
+                        self._trunc_board_files.append((s, _file_uri_to_path(m.group(1))))
 
     def empty(self):
         return not (self.incoming or self.outgoing or self.dispatched or self.board)

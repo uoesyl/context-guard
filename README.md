@@ -82,8 +82,6 @@ python $R --conv <会话ID> step 137              # 某一步全文
 python ~/.gemini/config/plugins/context-guard/scripts/context_stats.py [<会话ID> | --conv <会话ID> | --transcript <路径>] [--json]  # 无参默认分析最新会话
 ```
 
-侧边栏的「复制 /compact」和「提醒更新记忆」按钮可以在自然断点手动压缩，或让代理立即更新 `task_state.md`。
-
 ### 阈值配置
 
 阈值保存在 `~/.gemini/antigravity/plugin_data/context-guard/calibration.json`，会随实际自动压缩自动校准。需要手动指定某个模型的压缩目标时，在对应模型条目下加 `"override": <token数>`：
@@ -103,7 +101,7 @@ python ~/.gemini/config/plugins/context-guard/scripts/context_stats.py [<会话I
 
 ## 已知限制
 
-- **自动压缩与手动 `/compact` 的注入时机差异**：自动压缩发生在 `PreInvocation` 之后、模型调用之前，因此压缩后的首轮模型在只有有损摘要的情况下运行，由 `PreToolUse` 在首个修改类工具调用时拦截并注入完整恢复包（若该轮没有调用修改类工具，则在下一轮 `PreInvocation` 注入）；手动 `/compact` 在下一轮用户消息前已写入 `CHECKPOINT`，因此下次 `PreInvocation` 即可直接注入恢复包。
+- **自动压缩与手动 `/compact` 的注入时机差异**：自动压缩发生在 `PreInvocation` 之后、模型调用之前，因此压缩后的首轮模型在只有有损摘要的情况下运行，由 `PreToolUse` 在首个修改类工具调用时拦截并注入完整恢复包（若该轮没有调用修改类工具，则在下一轮 `PreInvocation` 注入）；纯手动 `/compact`（不带后续指令）在下一轮用户消息前已写入 `CHECKPOINT`，下次 `PreInvocation` 即可直接注入恢复包；而带指令的 `/compact <prompt>` 会在写入 `CHECKPOINT` 后同回合立即调用模型（中间不触发 `PreInvocation`），因此同样依赖 `PreToolUse` 拦截修改类工具或下一轮 `PreInvocation` 兜底注入。
 - 仪表盘的按步耗时 / TPS 依赖 Antigravity 会话数据库的内部格式，版本升级后可能需要适配。
 - 编辑 / 重试旧消息（回退）后，被丢弃分支上的模型调用不计入统计，面板会单独显示其数量。
 - 提示文字目前为中文。

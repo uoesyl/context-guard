@@ -62,6 +62,11 @@
           </div>
         </div>
 
+        <div id="cache-activity" class="cache-activity hidden" data-testid="cache-activity">
+          <div id="cache-activity-line" class="cache-activity-line"></div>
+          <div id="cache-compact-hint" class="cache-compact-hint hidden"></div>
+        </div>
+
         <div id="model-list" class="model-list" data-testid="model-list"></div>
 
         <div id="session-total-box" class="session-total-box hidden" data-testid="session-total-box">
@@ -88,15 +93,6 @@
             </div>
           </div>
           <button id="btn-open-ts" type="button" class="btn ghost sm" disabled>打开</button>
-        </div>
-
-        <div class="actions-row">
-          <button id="btn-copy-compact" type="button" class="btn primary" data-testid="btn-copy-compact">
-            复制 /compact
-          </button>
-          <button id="btn-remind-ts" type="button" class="btn secondary" data-testid="btn-remind-ts">
-            提醒更新记忆
-          </button>
         </div>
 
         <div id="ckpt-section" class="ckpt-section hidden">
@@ -224,7 +220,6 @@
     </section>
   </div>
 
-  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
   <script src="/app.js"></script>
 </body>
 </html>

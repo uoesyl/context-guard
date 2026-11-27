@@ -41,30 +41,6 @@ app.api('/api/context', (data) => {
   return snap;
 }, 'GET');
 
-app.api('/api/actions/remind-state', async (data) => {
-  const convId = String(data?.conversationId || app.config.conversationId || '').trim();
-  if (!convId || !ID_RE.test(convId)) {
-    return new Response(JSON.stringify({ ok: false, error: 'invalid conversationId' }), {
-      status: 400,
-      contentType: 'application/json',
-    });
-  }
-  const msg = (
-    '请在当前步骤完成后立即检查并更新本会话 artifact 目录下的 `task_state.md`' +
-    '（固定章节：目标 / 用户原话约束 / 已做决定及原因 / 已完成 / 待办 / 关键路径、命令与数值），' +
-    '保持精简（≤ 6KB），为后续 `/compact` 或自动压缩做好准备。'
-  );
-  try {
-    const res = await app.sendMessage(convId, msg);
-    return { ok: true, response: res };
-  } catch (err) {
-    return new Response(JSON.stringify({ ok: false, error: err?.message || String(err) }), {
-      status: 500,
-      contentType: 'application/json',
-    });
-  }
-}, 'POST');
-
 app.run().then(() => {
   console.log(`[context_meter] ready; appDataDirs=${findAppDataDirs().join(', ') || '(none)'}`);
 });

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, rmSync, utimesSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, rmSync, utimesSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -628,4 +628,108 @@ test('call_mcp_tool falls back to unknown for missing ServerName or ToolName', (
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('models.activity tracks cycle model activity, DB tEnd preference, hydrogen compact hint, and CHECKPOINT reset', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ctxact-'));
+  try {
+    const convId = '11111111-2222-3333-4444-aaaaaaaaaaaa';
+    const appData = join(root, 'antigravity');
+    const logsDir = join(appData, 'brain', convId, '.system_generated', 'logs');
+    const convsDir = join(appData, 'conversations');
+    mkdirSync(logsDir, { recursive: true });
+    mkdirSync(convsDir, { recursive: true });
+
+    const uuid1 = 'aaaaaaaa-1111-2222-3333-444444444444';
+    const dbEndSec = 1795800500;
+    const db = new DatabaseSync(join(convsDir, `${convId}.db`));
+    db.exec('CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB);');
+    db.exec('CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB);');
+    const gm1 = Buffer.concat([
+      pbBytes(1, pbBytes(19, Buffer.from('gemini-4-hydrogen-high'))),
+      pbBytes(4, Buffer.from(uuid1, 'ascii')),
+    ]);
+    db.prepare('INSERT INTO gen_metadata (idx, data) VALUES (?, ?)').run(1, gm1);
+    const meta2 = pbStepMeta(uuid1, dbEndSec - 10, dbEndSec - 5, dbEndSec);
+    db.prepare('INSERT INTO steps (idx, step_type, metadata) VALUES (?, ?, ?)').run(2, 15, meta2);
+    db.close();
+
+    const tp = join(logsDir, 'transcript_full.jsonl');
+    writeFileSync(tp, JSON.stringify({
+      step_index: 1,
+      type: 'PLANNER_RESPONSE',
+      model: 'gemini-4-hydrogen-high',
+      input_tokens: 10000,
+      cache_read_tokens: 90000,
+      created_at: '2026-11-28T01:00:00Z',
+    }) + '\n');
+    const snapOnlyH = buildContextSnapshot({ convId, appDataDirs: [appData], guardDataDir: join(root, 'g') });
+    assert.equal(snapOnlyH.models.activity.lastModel, 'gemini-4-hydrogen-high');
+    assert.equal(snapOnlyH.models.activity.lastStepAtMs, Date.parse('2026-11-28T01:00:00Z'));
+    assert.equal(snapOnlyH.models.activity.crossModelCompactRisk, false, 'hydrogen alone without planner in cycle');
+
+    // Add a planner model first? Wait: test planner -> hydrogen in same cycle with DB tEnd on step 2
+    writeFileSync(tp, [
+      JSON.stringify({
+        step_index: 1,
+        type: 'PLANNER_RESPONSE',
+        model: 'gemini-4-neon-xhigh',
+        input_tokens: 10000,
+        cache_read_tokens: 90000,
+        created_at: '2026-11-28T01:00:00Z',
+      }),
+      JSON.stringify({
+        step_index: 2,
+        type: 'PLANNER_RESPONSE',
+        model: 'gemini-4-hydrogen-high',
+        input_tokens: 20000,
+        cache_read_tokens: 80000,
+        created_at: '2026-11-28T01:01:00Z',
+      }),
+    ].join('\n') + '\n');
+    const snapSwitch = buildContextSnapshot({ convId, appDataDirs: [appData], guardDataDir: join(root, 'g') });
+    assert.equal(snapSwitch.models.activity.lastModel, 'gemini-4-hydrogen-high');
+    assert.equal(snapSwitch.models.activity.lastStepAtMs, dbEndSec * 1000, 'prefers DB tEnd over created_at');
+    assert.equal(snapSwitch.models.activity.crossModelCompactRisk, true);
+
+    appendFileSync(tp, JSON.stringify({
+      step_index: 3,
+      type: 'PLANNER_RESPONSE',
+      model: 'gemini-4-neon-xhigh',
+      input_tokens: 5000,
+      cache_read_tokens: 95000,
+      created_at: '2026-11-28T01:02:00Z',
+    }) + '\n');
+    const snapNeon = buildContextSnapshot({ convId, appDataDirs: [appData], guardDataDir: join(root, 'g') });
+    assert.equal(snapNeon.models.activity.lastModel, 'gemini-4-neon-xhigh');
+    assert.equal(snapNeon.models.activity.crossModelCompactRisk, false);
+
+    appendFileSync(tp, JSON.stringify({
+      step_index: 4,
+      type: 'CHECKPOINT',
+      content: '# Resuming',
+      created_at: '2026-11-28T01:03:00Z',
+    }) + '\n');
+    const snapAfterCkpt = buildContextSnapshot({ convId, appDataDirs: [appData], guardDataDir: join(root, 'g') });
+    assert.equal(snapAfterCkpt.models.activity.lastModel, null);
+    assert.equal(snapAfterCkpt.models.activity.lastStepAtMs, null);
+    assert.equal(snapAfterCkpt.models.activity.crossModelCompactRisk, false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('sidecar UI subtraction removes remind-state route, interactive buttons, and sets allows_user_interactions false', () => {
+  const dir = new URL('.', import.meta.url);
+  const sidecarJson = JSON.parse(readFileSync(new URL('./sidecar.json', dir), 'utf-8'));
+  const mainSrc = readFileSync(new URL('./main.mjs', dir), 'utf-8');
+  const htmlSrc = readFileSync(new URL('./index.html', dir), 'utf-8');
+  const appSrc = readFileSync(new URL('./app.js', dir), 'utf-8');
+  assert.equal(sidecarJson.agent_permissions?.allows_user_interactions, false);
+  assert.equal(mainSrc.includes('/api/actions/remind-state'), false);
+  assert.equal(mainSrc.includes('sendMessage'), false);
+  assert.equal(htmlSrc.includes('btn-copy-compact'), false);
+  assert.equal(htmlSrc.includes('btn-remind-ts'), false);
+  assert.equal(htmlSrc.includes('cache-activity'), true);
+  assert.equal(appSrc.includes('btn-open-ts'), true);
 });

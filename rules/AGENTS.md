@@ -2,7 +2,7 @@
 
 Antigravity 会在上下文接近当前模型的窗口时自动压缩（Gemini 约 512k；其他模型窗口不同，Context Guard 按模型自校准阈值预警），摘要有损。按以下规则维护工作记忆：
 
-1. **task_state.md**：多步任务（预计超过约 10 次工具调用，或跨多轮对话）开始时，在当前会话的 artifact 目录下创建 `task_state.md`（非用户可见的 artifact，不要求用户审阅），固定章节：
+1. **task_state.md**：多步任务（预计超过约 10 次工具调用，或跨多轮对话）开始时，在**当前会话自己**的 artifact 目录下创建 `task_state.md`（非用户可见的 artifact，不要求用户审阅；**严格归当前会话独占**：Swarm Coordinator 不得指派 Worker 修改 Coordinator 的 `task_state.md`，Worker 只能维护自己目录的 `task_state.md` 并通过消息板回报），固定章节：
    - 目标
    - 用户原话约束（逐字引用，不改写）
    - 已做决定及原因
